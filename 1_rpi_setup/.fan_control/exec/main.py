@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 
 import time
-import subprocess
 import logging
 import math
 import os
 import sys
-import json
 
 libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
 if os.path.exists(libdir):
@@ -21,7 +19,7 @@ logger = logging.getLogger()
 # Initialize fan controller
 fan_controller = waveshare_EMC2301.EMC2301()
 
-# Temperature thresholds (in Celsius)
+# Temperature thresholds (C)
 LOW_TEMP_THRESHOLD = 45.0
 HIGH_TEMP_THRESHOLD = 55.0
 VERY_HIGH_TEMP_THRESHOLD = 75.0
@@ -35,42 +33,33 @@ FAN_MIN = 100
 FAN_MAX = 255
 
 # Timing constants
-LOW_TEMP_DURATION = 30  # Seconds below LOW_TEMP_THRESHOLD to turn off fan
-VERY_HIGH_TEMP_DURATION = 10  # Seconds above VERY_HIGH_TEMP_THRESHOLD to force max speed
-CHECK_INTERVAL = 5  # Temperature check interval in seconds
+LOW_TEMP_DURATION = 30  # seconds
+VERY_HIGH_TEMP_DURATION = 10  # seconds
+CHECK_INTERVAL = 5  # seconds
 
-def get_temperature():
-    """Reads the CPU temperature."""
+def get_cpu_temperature():
     try:
-        temp_output = subprocess.check_output(['/usr/bin/vcgencmd', 'measure_temp']).decode('utf-8')
-        return float(temp_output.replace("temp=", "").replace("'C", "").strip())
+        with open("/sys/class/thermal/thermal_zone0/temp") as f:
+            return int(f.readline().strip()) / 1000.0
     except Exception as e:
         logger.error(f"Error reading CPU temperature: {e}")
         return None
 
 def get_nvme_temperature():
-    """Reads the NVMe temperature."""
     try:
-        output = subprocess.check_output(['nvme', 'smart-log', '/dev/nvme0n1', '--output-format', 'json']).decode('utf-8')
-        data = json.loads(output)
-        return math.ceil(data["temperature"] - 273.15)  # Convert from Kelvin to Celsius
+        with open("/sys/class/nvme/nvme0/hwmon0/temp1_input") as f:
+            return int(f.readline().strip()) / 1000.0
     except Exception as e:
         logger.error(f"Error reading NVMe temperature: {e}")
         return None
 
 def control_fan_speed(speed):
-    """Sets the fan speed."""
     try:
         fan_controller.EMC2301_Directspeedcontrol(int(speed))
-        logger.info(f"Fan speed set to {speed}")
     except Exception as e:
         logger.error(f"Error setting fan speed: {e}")
 
 def calculate_dynamic_speed(temp):
-    """
-    Calculates dynamic fan speed based on temperature.
-    Adjusts speed non-linearly for a smoother experience.
-    """
     temp_range = VERY_HIGH_TEMP_THRESHOLD - HIGH_TEMP_THRESHOLD
     if temp >= VERY_HIGH_TEMP_THRESHOLD:
         return FAN_MAX
@@ -84,9 +73,8 @@ def calculate_dynamic_speed(temp):
         return FAN_MIN
 
 def get_effective_temperature():
-    cpu_temp = get_temperature()
+    cpu_temp = get_cpu_temperature()
     nvme_temp = get_nvme_temperature()
-    
 
     temperatures = [t for t in [cpu_temp, nvme_temp] if t is not None]
     if not temperatures:
@@ -95,15 +83,32 @@ def get_effective_temperature():
     adjusted_nvme_temp = nvme_temp + NVME_TEMP_OFFSET if nvme_temp else None
     effective_temp = max([t for t in [cpu_temp, adjusted_nvme_temp] if t is not None])
 
-    #logger.info(f"CPU temperature: {cpu_temp}C, NVME temperature: {nvme_temp}C, Effective temperature: {effective_temp}C")
-
     return effective_temp
+
+def decide_fan_speed(temp, current_speed, low_temp_start, very_high_temp_start):
+    now = time.time()
+
+    if temp >= VERY_HIGH_TEMP_THRESHOLD:
+        very_high_temp_start = very_high_temp_start or now
+        if now - very_high_temp_start > VERY_HIGH_TEMP_DURATION:
+            return FAN_MAX, None, very_high_temp_start
+
+    elif HIGH_TEMP_THRESHOLD <= temp < VERY_HIGH_TEMP_THRESHOLD:
+        return calculate_dynamic_speed(temp), None, None
+
+    elif temp < LOW_TEMP_THRESHOLD:
+        low_temp_start = low_temp_start or now
+        if now - low_temp_start > LOW_TEMP_DURATION:
+            return FAN_OFF, low_temp_start, None
+
+    return current_speed, low_temp_start, very_high_temp_start
+
 
 def main():
     low_temp_start = None
     very_high_temp_start = None
     current_fan_speed = FAN_OFF
-    control_fan_speed(FAN_OFF)
+    control_fan_speed(current_fan_speed)
 
     try:
         while True:
@@ -112,32 +117,14 @@ def main():
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            if temperature >= VERY_HIGH_TEMP_THRESHOLD:
-                if very_high_temp_start is None:
-                    very_high_temp_start = time.time()
-                elif time.time() - very_high_temp_start > VERY_HIGH_TEMP_DURATION:
-                    if current_fan_speed != FAN_MAX:
-                        control_fan_speed(FAN_MAX)
-                        current_fan_speed = FAN_MAX
-                low_temp_start = None
-            else:
-                very_high_temp_start = None
+            new_speed, low_temp_start, very_high_temp_start = decide_fan_speed(
+                temperature, current_fan_speed, low_temp_start, very_high_temp_start
+            )
 
-            if HIGH_TEMP_THRESHOLD <= temperature < VERY_HIGH_TEMP_THRESHOLD:
-                new_speed = calculate_dynamic_speed(temperature)
-                if current_fan_speed != new_speed:
-                    control_fan_speed(new_speed)
-                    current_fan_speed = new_speed
-                low_temp_start = None
-
-            if temperature < LOW_TEMP_THRESHOLD:
-                if low_temp_start is None:
-                    low_temp_start = time.time()
-                elif time.time() - low_temp_start > LOW_TEMP_DURATION:
-                    if current_fan_speed != FAN_OFF:
-                        control_fan_speed(FAN_OFF)
-                        current_fan_speed = FAN_OFF
-                very_high_temp_start = None
+            if new_speed != current_fan_speed:
+                logger.info(f"Fan speed set to {new_speed} (was {current_fan_speed}), Effective temp: {temperature}C")
+                control_fan_speed(new_speed)
+                current_fan_speed = new_speed
 
             time.sleep(CHECK_INTERVAL)
 
