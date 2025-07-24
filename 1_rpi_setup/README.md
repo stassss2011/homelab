@@ -118,3 +118,11 @@
 
 - <https://www.waveshare.com/wiki/CM4-IO-BASE-B#Fan>
 - <https://www.waveshare.com/wiki/CM4_RTC_FAN>
+
+## TO Check
+
+- nvme temp
+
+```bash
+sudo nvme smart-log /dev/nvme0n1
+```
