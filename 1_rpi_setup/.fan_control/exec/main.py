@@ -6,6 +6,7 @@ import logging
 import math
 import os
 import sys
+import json
 
 libdir = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), 'lib')
 if os.path.exists(libdir):
@@ -25,6 +26,9 @@ LOW_TEMP_THRESHOLD = 45.0
 HIGH_TEMP_THRESHOLD = 55.0
 VERY_HIGH_TEMP_THRESHOLD = 75.0
 
+# NVMe Temperature offset
+NVME_TEMP_OFFSET = 5
+
 # Fan speed constants
 FAN_OFF = 0
 FAN_MIN = 100
@@ -33,7 +37,7 @@ FAN_MAX = 255
 # Timing constants
 LOW_TEMP_DURATION = 30  # Seconds below LOW_TEMP_THRESHOLD to turn off fan
 VERY_HIGH_TEMP_DURATION = 10  # Seconds above VERY_HIGH_TEMP_THRESHOLD to force max speed
-CHECK_INTERVAL = 1  # Temperature check interval in seconds
+CHECK_INTERVAL = 5  # Temperature check interval in seconds
 
 def get_temperature():
     """Reads the CPU temperature."""
@@ -41,7 +45,17 @@ def get_temperature():
         temp_output = subprocess.check_output(['/usr/bin/vcgencmd', 'measure_temp']).decode('utf-8')
         return float(temp_output.replace("temp=", "").replace("'C", "").strip())
     except Exception as e:
-        logger.error(f"Error reading temperature: {e}")
+        logger.error(f"Error reading CPU temperature: {e}")
+        return None
+
+def get_nvme_temperature():
+    """Reads the NVMe temperature."""
+    try:
+        output = subprocess.check_output(['nvme', 'smart-log', '/dev/nvme0n1', '--output-format', 'json']).decode('utf-8')
+        data = json.loads(output)
+        return math.ceil(data["temperature"] - 273.15)  # Convert from Kelvin to Celsius
+    except Exception as e:
+        logger.error(f"Error reading NVMe temperature: {e}")
         return None
 
 def control_fan_speed(speed):
@@ -69,6 +83,22 @@ def calculate_dynamic_speed(temp):
     else:
         return FAN_MIN
 
+def get_effective_temperature():
+    cpu_temp = get_temperature()
+    nvme_temp = get_nvme_temperature()
+    
+
+    temperatures = [t for t in [cpu_temp, nvme_temp] if t is not None]
+    if not temperatures:
+        return None
+
+    adjusted_nvme_temp = nvme_temp + NVME_TEMP_OFFSET if nvme_temp else None
+    effective_temp = max([t for t in [cpu_temp, adjusted_nvme_temp] if t is not None])
+
+    #logger.info(f"CPU temperature: {cpu_temp}C, NVME temperature: {nvme_temp}C, Effective temperature: {effective_temp}C")
+
+    return effective_temp
+
 def main():
     low_temp_start = None
     very_high_temp_start = None
@@ -77,14 +107,11 @@ def main():
 
     try:
         while True:
-            temperature = get_temperature()
+            temperature = get_effective_temperature()
             if temperature is None:
                 time.sleep(CHECK_INTERVAL)
                 continue
 
-            logger.info(f"Current temperature: {temperature}C")
-
-            # Handle temperature above VERY_HIGH_TEMP_THRESHOLD
             if temperature >= VERY_HIGH_TEMP_THRESHOLD:
                 if very_high_temp_start is None:
                     very_high_temp_start = time.time()
@@ -96,7 +123,6 @@ def main():
             else:
                 very_high_temp_start = None
 
-            # Handle temperature between HIGH_TEMP_THRESHOLD and VERY_HIGH_TEMP_THRESHOLD
             if HIGH_TEMP_THRESHOLD <= temperature < VERY_HIGH_TEMP_THRESHOLD:
                 new_speed = calculate_dynamic_speed(temperature)
                 if current_fan_speed != new_speed:
@@ -104,7 +130,6 @@ def main():
                     current_fan_speed = new_speed
                 low_temp_start = None
 
-            # Handle temperature below LOW_TEMP_THRESHOLD
             if temperature < LOW_TEMP_THRESHOLD:
                 if low_temp_start is None:
                     low_temp_start = time.time()
